@@ -421,4 +421,4 @@ def render_img_training_view(args, testbed, log_ptr, image_dir, frame_time_id = 
 
     return load_image(image), load_image(ref_image), normal_img
 
-from pytorch3d_utils import *
+# from pytorch3d_utils import *

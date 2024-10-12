@@ -226,14 +226,6 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 		throw std::runtime_error{"hdf5 is no longer supported. please use the hdf52nerf.py conversion script"};
 	}
 
-	// auto transfer_to_downsample_json = [] (const auto& path, const bool is_downsample) {
-	// 	if (!is_downsample) {
-	// 		return path.str();
-	// 	}
-	// 	std::string downsample_path = path.stem().str() + std::string{"_downsample.json"};
-	// 	printf("load downsample json: %s\n", downsample_path.c_str());
-	// 	return downsample_path;
-	// };
 	// nerf original format
 	std::vector<nlohmann::json> jsons;
 	std::transform(
@@ -245,55 +237,45 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 	);
 
 	// For dynamic scene: one json for all frame, all images in one frame
+	// reserve multi json, not for dynamic scene
 
 	result.n_images = 0;
-	for (size_t i = 0; i < jsons.size(); ++i) {
-		auto& json = jsons[i];
-		fs::path basepath = jsonpaths[i].parent_path();
-		if (!json.contains("frames") || !json["frames"].is_array()) {
-			tlog::warning() << "  " << jsonpaths[i] << " does not contain any frames. Skipping.";
-			continue;
-		}
-		tlog::info() << "  " << jsonpaths[i];
-		auto& frames = json["frames"];
+	auto& json = jsons[0];
+	fs::path basepath = jsonpaths[0].parent_path();
+	if (!json.contains("frames") || !json["frames"].is_array()) {
+		tlog::error() << "  " << jsonpaths[0] << " no frames in json. Skipping.";
+		throw std::runtime_error{"No frames in json"};
+	}
+	tlog::info() << "  " << jsonpaths[0];
+	auto& frames = json["frames"];
 
-		float sharpness_discard_threshold = json.value("sharpness_discard_threshold", 0.0f); // Keep all by default
+	float sharpness_discard_threshold = json.value("sharpness_discard_threshold", 0.0f); // Keep all by default
 
-		// std::sort(frames.begin(), frames.end(), [](const auto& frame1, const auto& frame2) {
-		// 	return frame1["file_path"] < frame2["file_path"];
-		// });
+	if (frames[0].contains("sharpness")) {
+		auto frames_copy = frames;
+		frames.clear();
 
-		if (json.contains("n_frames")) {
-			size_t cull_idx = std::min(frames.size(), (size_t)json["n_frames"]);
-			frames.get_ptr<nlohmann::json::array_t*>()->resize(cull_idx);
-		}
+		// Kill blurrier frames than their neighbors
+		const int neighborhood_size = 3;
+		for (int i = 0; i < (int)frames_copy.size(); ++i) {
+			float mean_sharpness = 0.0f;
+			int mean_start = std::max(0, i-neighborhood_size);
+			int mean_end = std::min(i+neighborhood_size, (int)frames_copy.size()-1);
+			for (int j = mean_start; j < mean_end; ++j) {
+				mean_sharpness += float(frames_copy[j]["sharpness"]);
+			}
+			mean_sharpness /= (mean_end - mean_start);
 
-		if (frames[0].contains("sharpness")) {
-			auto frames_copy = frames;
-			frames.clear();
+			// Compatibility with Windows paths on Linux. (Breaks linux filenames with "\\" in them, which is acceptable for us.)
+			frames_copy[i]["file_path"] = replace_all(frames_copy[i]["file_path"], "\\", "/");
 
-			// Kill blurrier frames than their neighbors
-			const int neighborhood_size = 3;
-			for (int i = 0; i < (int)frames_copy.size(); ++i) {
-				float mean_sharpness = 0.0f;
-				int mean_start = std::max(0, i-neighborhood_size);
-				int mean_end = std::min(i+neighborhood_size, (int)frames_copy.size()-1);
-				for (int j = mean_start; j < mean_end; ++j) {
-					mean_sharpness += float(frames_copy[j]["sharpness"]);
-				}
-				mean_sharpness /= (mean_end - mean_start);
-
-				// Compatibility with Windows paths on Linux. (Breaks linux filenames with "\\" in them, which is acceptable for us.)
-				frames_copy[i]["file_path"] = replace_all(frames_copy[i]["file_path"], "\\", "/");
-
-				if ((basepath / fs::path(std::string(frames_copy[i]["file_path"]))).exists() && frames_copy[i]["sharpness"] > sharpness_discard_threshold * mean_sharpness) {
-					frames.emplace_back(frames_copy[i]);
-				}
+			if ((basepath / fs::path(std::string(frames_copy[i]["file_path"]))).exists() && frames_copy[i]["sharpness"] > sharpness_discard_threshold * mean_sharpness) {
+				frames.emplace_back(frames_copy[i]);
 			}
 		}
-
-		result.n_images += frames.size();
 	}
+
+	result.n_images = frames.size();
 
 	images.resize(result.n_images);
 	result.xforms.resize(result.n_images);
@@ -341,10 +323,6 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 
 		if (json.contains("normal_mts_args")) {
 			result.from_mitsuba = true;
-		}
-
-		if (json.contains("from_na")) {
-			result.from_na = true;
 		}
 
 		if (json.contains("fix_premult")) {
@@ -568,25 +546,6 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 					}
 				}
 
-				fs::path maskpath = path.parent_path()/(std::string{"dynamic_mask_"} + path.basename() + ".png");
-				if (maskpath.exists()) {
-					int wa=0,ha=0;
-					uint8_t* mask_img = stbi_load(maskpath.str().c_str(), &wa, &ha, &comp, 4);
-					if (!mask_img) {
-						throw std::runtime_error{std::string{"Could not load mask image "} + maskpath.str()};
-					}
-					ScopeGuard mem_guard{[&]() { stbi_image_free(mask_img); }};
-					if (wa != dst.res.x() || ha != dst.res.y()) {
-						throw std::runtime_error{std::string{"Mask image has wrong resolution: "} + maskpath.str()};
-					}
-					dst.mask_color = 0x00FF00FF; // HOT PINK
-					for (int i = 0; i < dst.res.prod(); ++i) {
-						if (mask_img[i*4] != 0) {
-							*(uint32_t*)&img[i*4] = dst.mask_color;
-						}
-					}
-				}
-
 				dst.pixels = img;
 				dst.image_type = EImageDataType::Byte;
 			}
@@ -655,12 +614,7 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 					return (float)json["fl_"s + axis];
 				} else if (json.contains("camera_angle_"s + axis)) {
 					return fov_to_focal_length(resolution, (float)json["camera_angle_"s + axis] * 180 / PI());
-				} else if (frame.contains("fl_"s + axis)) {
-					return (float)frame["fl_"s + axis];
-				} else if (frame.contains("camera_angle_"s + axis)) {
-					return fov_to_focal_length(resolution, (float)frame["camera_angle_"s + axis] * 180 / PI());
-				} 
-				else {
+				} else {
 					return 0.0f;
 				}
 			};
@@ -680,21 +634,17 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 				if (frame.contains("intrinsic_matrix")){
 					const auto& intrinsic = frame["intrinsic_matrix"];
 					result.metadata[i_img].focal_length.x() = float(intrinsic[0][0]);
-					 result.metadata[i_img].focal_length.y() = float(intrinsic[1][1]);
+					result.metadata[i_img].focal_length.y() = float(intrinsic[1][1]);
 					result.metadata[i_img].principal_point.x() = float(intrinsic[0][2])/(float)json["w"];
 					result.metadata[i_img].principal_point.y() = float(intrinsic[1][2])/(float)json["h"];
-				}
-				else{
+				} else if (frame.contains("K")) {
+					result.metadata[i_img].focal_length.x() = float(frame["K"][0][0]);
+					result.metadata[i_img].focal_length.y() = float(frame["K"][1][1]);
+					result.metadata[i_img].principal_point.x() = float(frame["K"][0][2])/(float)frame["w"];
+					result.metadata[i_img].principal_point.y() = float(frame["K"][1][2])/(float)frame["h"];
+				} else{
 					throw std::runtime_error{"Couldn't read fov."};
 				}
-			}
-
-			if (frame.contains("cx")) {
-				result.metadata[i_img].principal_point.x() = float(frame["cx"]) / (float)(frame["w"]);
-			}
-
-			if (frame.contains("cy")) {
-				result.metadata[i_img].principal_point.y() = float(frame["cy"]) / (float)(frame["h"]);
 			}
 
 			for (int m = 0; m < 3; ++m) {
@@ -705,7 +655,6 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 			}
 
 			result.metadata[i_img].rolling_shutter = rolling_shutter;
-			// result.metadata[i_img].principal_point = principal_point;
 			result.metadata[i_img].camera_distortion = camera_distortion;
 
 			result.xforms[i_img].start = result.nerf_matrix_to_ngp(result.xforms[i_img].start);
